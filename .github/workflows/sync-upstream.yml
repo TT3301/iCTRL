@@ -1,0 +1,72 @@
+# Keep this fork's default branch and releases in step with its upstream (the fork parent).
+# Token: secrets.SYNC_TOKEN (fine-grained PAT, this repo only, Contents + Workflows read/write)
+# is needed once upstream commits touch .github/workflows; until then GITHUB_TOKEN is enough.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Sync default branch
+        run: |
+          branch=$(gh api "repos/$REPO" -q .default_branch)
+          # Same as the "Sync fork" button: fast-forward, or a merge commit that keeps this workflow.
+          gh api -X POST "repos/$REPO/merge-upstream" -f branch="$branch" -q '"\(.merge_type): \(.message)"'
+
+      - name: Mirror releases
+        run: |
+          set -euo pipefail
+          upstream=$(gh api "repos/$REPO" -q .parent.full_name)
+          latest=$(gh api "repos/$upstream/releases/latest" -q .tag_name 2>/dev/null || true)
+          work=$(mktemp -d)
+          failed=0
+
+          # Only releases newer than the newest one already mirrored (just upstream's newest on an empty fork).
+          # The boundary release is kept so its missing assets still get repaired. Oldest first.
+          have=$(gh api --paginate "repos/$REPO/releases" -q '.[].tag_name')
+          todo=()
+          for tag in $(gh api "repos/$upstream/releases?per_page=100" -q '.[] | select(.draft | not) | .tag_name'); do
+            todo=("$tag" "${todo[@]}")
+            if [ -z "$have" ] || grep -qxF "$tag" <<<"$have"; then break; fi
+          done
+
+          for tag in "${todo[@]}"; do
+            src=$(gh api "repos/$upstream/releases/tags/$tag")
+            if ! grep -qxF "$tag" <<<"$have"; then
+              sha=$(gh api "repos/$upstream/commits/$tag" -q .sha)
+              jq -r '.body // ""' <<<"$src" > "$work/notes.md"
+              name=$(jq -r '.name // ""' <<<"$src")
+              flags=(--target "$sha" --title "${name:-$tag}" --notes-file "$work/notes.md" --latest="$([ "$tag" = "$latest" ] && echo true || echo false)")
+              [ "$(jq -r .prerelease <<<"$src")" = true ] && flags+=(--prerelease)
+              gh release create "$tag" -R "$REPO" "${flags[@]}" || { echo "::error::create $tag failed"; failed=1; continue; }
+              echo "created $tag"
+            fi
+
+            # Upload whatever upstream has that is not fully uploaded here (also repairs half-done runs).
+            have=$(gh api "repos/$REPO/releases/tags/$tag" -q '.assets[] | select(.state == "uploaded") | .name')
+            dir="$work/$tag"; mkdir -p "$dir"
+            while IFS= read -r asset; do
+              [ -n "$asset" ] && ! grep -qxF "$asset" <<<"$have" || continue
+              gh release download "$tag" -R "$upstream" -p "$asset" -D "$dir" \
+                && gh release upload "$tag" -R "$REPO" "$dir/$asset" --clobber \
+                && echo "uploaded $tag/$asset" \
+                || { echo "::error::asset $tag/$asset failed"; failed=1; }
+            done < <(jq -r '.assets[].name' <<<"$src")
+            rm -rf "$dir"
+          done
+          exit $failed
