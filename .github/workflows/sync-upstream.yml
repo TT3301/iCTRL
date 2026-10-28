@@ -58,10 +58,10 @@ jobs:
             fi
 
             # Upload whatever upstream has that is not fully uploaded here (also repairs half-done runs).
-            have=$(gh api "repos/$REPO/releases/tags/$tag" -q '.assets[] | select(.state == "uploaded") | .name')
+            uploaded=$(gh api "repos/$REPO/releases/tags/$tag" -q '.assets[] | select(.state == "uploaded") | .name')
             dir="$work/$tag"; mkdir -p "$dir"
             while IFS= read -r asset; do
-              [ -n "$asset" ] && ! grep -qxF "$asset" <<<"$have" || continue
+              [ -n "$asset" ] && ! grep -qxF "$asset" <<<"$uploaded" || continue
               gh release download "$tag" -R "$upstream" -p "$asset" -D "$dir" \
                 && gh release upload "$tag" -R "$REPO" "$dir/$asset" --clobber \
                 && echo "uploaded $tag/$asset" \
